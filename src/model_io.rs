@@ -1,7 +1,7 @@
 //! JSON deserialization for RDST model files.
 //!
 //! Supports both camelCase (`nShapelets`) and snake_case (`n_shapelets`) field
-//! names, matching the Python `export_model.py` output.
+//! names, matching the Python aeon export helper output.
 
 use serde_json::Value;
 

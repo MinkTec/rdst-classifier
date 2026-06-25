@@ -1,9 +1,11 @@
-//! Pure-Rust inference engine for the **Random Dilated Shapelet Transform (RDST)**
-//! classifier.
+//! Pure-Rust inference engine for trained **Random Dilated Shapelet Transform
+//! (RDST)** time-series classifiers.
 //!
-//! This crate is a faithful port of the `dart_rdst_classifier` Dart package
-//! and loads the same JSON model files produced by the Python
-//! `aeon` / `export_model.py` toolchain.
+//! Train an RDST model in Python with aeon, export the fitted shapelets, scaler,
+//! and ridge classifier to JSON, then use this crate to run deterministic
+//! inference from Rust or through the UniFFI bindings. The implementation is
+//! generic over numeric time-series data; the input only needs to be shaped as
+//! `n_samples × n_channels × n_timepoints`.
 //!
 //! # Pipeline
 //!
@@ -59,7 +61,7 @@ use std::sync::Arc;
 // Pure-Rust high-level API
 // ---------------------------------------------------------------------------
 
-/// High-level inference pipeline for the RDST classifier.
+/// High-level inference pipeline for a trained RDST classifier.
 ///
 /// Loads a trained model and runs:
 /// `RdstTransform → StandardScaler → RidgeClassifier`
@@ -81,7 +83,7 @@ pub struct RdstClassifier {
 }
 
 impl RdstClassifier {
-    /// Loads a model from a JSON string (produced by `export_model.py`).
+    /// Loads a model from a JSON string produced by the aeon export helper.
     pub fn from_json(json: &str) -> Result<Self, ClassifierError> {
         let model = model_io::from_json(json)?;
         Ok(Self { model })

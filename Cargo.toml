@@ -4,7 +4,7 @@ version = "0.5.3"
 edition = "2021"
 description = "Pure-Rust inference engine for the Random Dilated Shapelet Transform (RDST) classifier"
 authors = ["minktec"]
-license = "MIT"
+license = "Apache-2.0"
 repository = "https://github.com/minktec/rdst-classifier"
 
 [lib]
