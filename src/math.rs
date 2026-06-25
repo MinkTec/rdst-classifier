@@ -120,5 +120,4 @@ mod tests {
         // 25th percentile of [0,1,2,3]: idx = 0.25*3 = 0.75 → 0.0*0.25 + 1.0*0.75 = 0.75
         assert_abs_diff_eq!(percentile(&v, 25.0), 0.75, epsilon = 1e-12);
     }
-
 }

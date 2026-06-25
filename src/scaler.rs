@@ -8,18 +8,24 @@ use crate::model::ScalerParams;
 /// When `scale[j] == 0`, the corresponding output column is set to 0.0
 /// (avoids NaN).
 pub fn scale(x: &[f64], n_samples: usize, n_features: usize, params: &ScalerParams) -> Vec<f64> {
-    let mut result = vec![0.0f64; n_samples * n_features];
-    for i in 0..n_samples {
-        for j in 0..n_features {
+    let mut result = x.to_vec();
+    scale_in_place(&mut result, n_samples, n_features, params);
+    result
+}
+
+/// Scales a feature matrix in place.
+pub fn scale_in_place(x: &mut [f64], n_samples: usize, n_features: usize, params: &ScalerParams) {
+    debug_assert_eq!(x.len(), n_samples * n_features);
+    for row in x.chunks_mut(n_features).take(n_samples) {
+        for (j, value) in row.iter_mut().enumerate() {
             let s = params.scale[j];
-            result[i * n_features + j] = if s == 0.0 {
+            *value = if s == 0.0 {
                 0.0
             } else {
-                (x[i * n_features + j] - params.mean[j]) / s
+                (*value - params.mean[j]) / s
             };
         }
     }
-    result
 }
 
 // ---------------------------------------------------------------------------

@@ -10,7 +10,8 @@
 //! 2. `batch/predict_proba/1000`  — same, with probabilities
 //! 3. `single/predict`            — single-sample repeated (integration model)
 //! 4. `single/predict_proba`      — single-sample repeated (integration model)
-//! 5. `production/predict_single_window` — single window from each RSF file using
+//! 5. `synthetic/*`              — deterministic in-repo example model/data
+//! 6. `production/predict_single_window` — single window from each RSF file using
 //!    the production `model.tar.gz` (10 000 shapelets, 25 channels)
 
 use std::io::Read;
@@ -18,6 +19,7 @@ use std::path::PathBuf;
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use rdst_classifier::RdstClassifier;
+use serde_json::json;
 
 // ---------------------------------------------------------------------------
 // Path helpers
@@ -51,6 +53,110 @@ struct BatchBenchData {
     x_1: Vec<f64>,
     n_channels: usize,
     n_timepoints: usize,
+}
+
+// ---------------------------------------------------------------------------
+// Synthetic in-repo bench data
+// ---------------------------------------------------------------------------
+
+struct SyntheticBenchData {
+    clf: RdstClassifier,
+    x_batch: Vec<f64>,
+    x_single: Vec<f64>,
+    n_samples: usize,
+    n_channels: usize,
+    n_timepoints: usize,
+}
+
+fn load_synthetic_bench_data() -> SyntheticBenchData {
+    let n_shapelets = 256usize;
+    let n_channels = 8usize;
+    let n_timepoints = 96usize;
+    let n_samples = 32usize;
+
+    let mut values = Vec::with_capacity(n_shapelets);
+    let mut lengths = Vec::with_capacity(n_shapelets);
+    let mut dilations = Vec::with_capacity(n_shapelets);
+    let mut thresholds = Vec::with_capacity(n_shapelets);
+    let mut normalise = Vec::with_capacity(n_shapelets);
+    let mut means = Vec::with_capacity(n_shapelets);
+    let mut stds = Vec::with_capacity(n_shapelets);
+
+    for i in 0..n_shapelets {
+        let length = 5 + (i % 4);
+        let dilation = 1 + (i % 5);
+        lengths.push(length);
+        dilations.push(dilation);
+        thresholds.push((n_channels * length) as f64 * (0.6 + (i % 7) as f64 * 0.03));
+        normalise.push(i % 2 == 0);
+        means.push(vec![0.0; n_channels]);
+        stds.push(vec![1.0; n_channels]);
+
+        let mut shapelet_channels = Vec::with_capacity(n_channels);
+        for c in 0..n_channels {
+            let mut channel = Vec::with_capacity(length);
+            for j in 0..length {
+                let raw = ((i * 31 + c * 7 + j * 13) % 37) as f64;
+                channel.push(raw / 18.0 - 1.0);
+            }
+            shapelet_channels.push(channel);
+        }
+        values.push(shapelet_channels);
+    }
+
+    let n_features = n_shapelets * 3;
+    let mean = vec![0.0; n_features];
+    let scale = vec![1.0; n_features];
+    let coef: Vec<f64> = (0..n_features)
+        .map(|j| ((j * 17 % 29) as f64 - 14.0) / 100.0)
+        .collect();
+
+    let model = json!({
+        "version": "synthetic-bench",
+        "n_shapelets": n_shapelets,
+        "n_channels": n_channels,
+        "shapelets": {
+            "values": values,
+            "lengths": lengths,
+            "dilations": dilations,
+            "thresholds": thresholds,
+            "normalise": normalise,
+            "means": means,
+            "stds": stds,
+        },
+        "scaler": {
+            "mean": mean,
+            "scale": scale,
+        },
+        "classifier": {
+            "coef": [coef],
+            "intercept": [0.0],
+            "classes": ["low", "high"],
+        },
+    });
+    let model_json = serde_json::to_string(&model).unwrap();
+    let clf = RdstClassifier::from_json(&model_json).unwrap();
+
+    let sample_stride = n_channels * n_timepoints;
+    let mut x_batch = vec![0.0; n_samples * sample_stride];
+    for s in 0..n_samples {
+        for c in 0..n_channels {
+            for t in 0..n_timepoints {
+                let raw = ((s * 19 + c * 23 + t * 5) % 41) as f64;
+                x_batch[s * sample_stride + c * n_timepoints + t] = raw / 20.0 - 1.0;
+            }
+        }
+    }
+    let x_single = x_batch[..sample_stride].to_vec();
+
+    SyntheticBenchData {
+        clf,
+        x_batch,
+        x_single,
+        n_samples,
+        n_channels,
+        n_timepoints,
+    }
 }
 
 fn load_batch_bench_data() -> Option<BatchBenchData> {
@@ -328,6 +434,76 @@ fn bench_single_predict(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
+// Synthetic example model — always available in this repository
+// ---------------------------------------------------------------------------
+
+fn bench_synthetic(c: &mut Criterion) {
+    let data = load_synthetic_bench_data();
+
+    let mut batch = c.benchmark_group("synthetic/batch");
+    batch.throughput(Throughput::Elements(data.n_samples as u64));
+
+    batch.bench_function(BenchmarkId::new("predict", data.n_samples), |b| {
+        b.iter(|| {
+            data.clf
+                .predict(
+                    black_box(&data.x_batch),
+                    black_box(data.n_samples),
+                    black_box(data.n_channels),
+                    black_box(data.n_timepoints),
+                )
+                .unwrap()
+        })
+    });
+
+    batch.bench_function(BenchmarkId::new("predict_proba", data.n_samples), |b| {
+        b.iter(|| {
+            data.clf
+                .predict_proba(
+                    black_box(&data.x_batch),
+                    black_box(data.n_samples),
+                    black_box(data.n_channels),
+                    black_box(data.n_timepoints),
+                )
+                .unwrap()
+        })
+    });
+
+    batch.finish();
+
+    let mut single = c.benchmark_group("synthetic/single");
+    single.throughput(Throughput::Elements(1));
+
+    single.bench_function("predict", |b| {
+        b.iter(|| {
+            data.clf
+                .predict(
+                    black_box(&data.x_single),
+                    black_box(1),
+                    black_box(data.n_channels),
+                    black_box(data.n_timepoints),
+                )
+                .unwrap()
+        })
+    });
+
+    single.bench_function("predict_proba", |b| {
+        b.iter(|| {
+            data.clf
+                .predict_proba(
+                    black_box(&data.x_single),
+                    black_box(1),
+                    black_box(data.n_channels),
+                    black_box(data.n_timepoints),
+                )
+                .unwrap()
+        })
+    });
+
+    single.finish();
+}
+
+// ---------------------------------------------------------------------------
 // Bench 5: production model — sliding-window over all RSF files
 // ---------------------------------------------------------------------------
 
@@ -381,6 +557,7 @@ criterion_group!(
     benches,
     bench_batch_predict,
     bench_single_predict,
+    bench_synthetic,
     bench_production_rsf
 );
 criterion_main!(benches);

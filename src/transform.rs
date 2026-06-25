@@ -12,9 +12,11 @@ use std::collections::HashMap;
 use rayon::prelude::*;
 
 use crate::{
+    classifier::PreparedRidgeParams,
     model::RdstModel,
     subsequence::{
-        compute_shapelet_features, get_all_subsequences, normalise_subsequences, sliding_mean_std,
+        compute_shapelet_features, get_all_subsequences_into, normalise_subsequences_in_place,
+        sliding_mean_std_into,
     },
 };
 
@@ -37,16 +39,38 @@ pub fn transform(
     n_timepoints: usize,
     model: &RdstModel,
 ) -> Vec<f64> {
+    // Identify unique (length, dilation) pairs and which shapelet indices
+    // belong to each pair — computed once, shared across all samples.
+    let groups = build_groups(model);
+    transform_with_groups(x, n_samples, n_channels, n_timepoints, model, &groups)
+}
+
+pub(crate) fn transform_with_groups(
+    x: &[f64],
+    n_samples: usize,
+    n_channels: usize,
+    n_timepoints: usize,
+    model: &RdstModel,
+    groups: &[ShapeletGroup],
+) -> Vec<f64> {
     let n_shapelets = model.n_shapelets;
     let n_features = 3 * n_shapelets;
     let sample_stride = n_channels * n_timepoints;
 
-    // Identify unique (length, dilation) pairs and which shapelet indices
-    // belong to each pair — computed once, shared across all samples.
-    let groups = build_groups(model);
-
     // Allocate output; each sample writes its own row independently.
     let mut result = vec![0.0f64; n_samples * n_features];
+
+    if n_samples == 1 {
+        transform_sample(
+            &x[..sample_stride],
+            n_channels,
+            n_timepoints,
+            model,
+            groups,
+            &mut result,
+        );
+        return result;
+    }
 
     // Process samples in parallel. Each chunk is one sample's feature row.
     result
@@ -60,16 +84,72 @@ pub fn transform(
     result
 }
 
+pub(crate) fn transform_scores(
+    x: &[f64],
+    n_samples: usize,
+    n_channels: usize,
+    n_timepoints: usize,
+    model: &RdstModel,
+    groups: &[ShapeletGroup],
+    classifier: &PreparedRidgeParams,
+) -> Vec<f64> {
+    let n_rows = classifier.n_rows;
+    let sample_stride = n_channels * n_timepoints;
+    let mut result = vec![0.0f64; n_samples * n_rows];
+
+    if n_samples == 1 {
+        result.copy_from_slice(&classifier.intercept);
+        transform_sample_scores(
+            &x[..sample_stride],
+            n_channels,
+            n_timepoints,
+            model,
+            groups,
+            classifier,
+            &mut result,
+        );
+        return result;
+    }
+
+    result
+        .par_chunks_mut(n_rows)
+        .enumerate()
+        .for_each(|(i_sample, scores)| {
+            scores.copy_from_slice(&classifier.intercept);
+            let sample = &x[i_sample * sample_stride..(i_sample + 1) * sample_stride];
+            transform_sample_scores(
+                sample,
+                n_channels,
+                n_timepoints,
+                model,
+                groups,
+                classifier,
+                scores,
+            );
+        });
+
+    result
+}
+
 /// Process a single sample into `out_row` (length = `3 * n_shapelets`).
 fn transform_sample(
     sample: &[f64],
     n_channels: usize,
     n_timepoints: usize,
     model: &RdstModel,
-    groups: &HashMap<(usize, usize), ShapeletGroup>,
+    groups: &[ShapeletGroup],
     out_row: &mut [f64],
 ) {
-    for (&(length, dilation), group) in groups {
+    let mut subs = Vec::new();
+    let mut means = Vec::new();
+    let mut stds = Vec::new();
+    let mut sum = Vec::new();
+    let mut sum2 = Vec::new();
+
+    for group in groups {
+        let length = group.length;
+        let dilation = group.dilation;
+
         // Minimum number of timepoints needed for at least one subsequence:
         // the dilated span is (length − 1) * dilation + 1 timepoints.
         let min_needed = (length - 1) * dilation + 1;
@@ -81,7 +161,14 @@ fn transform_sample(
         let n_subs = n_timepoints - (length - 1) * dilation;
 
         // Compute raw subsequences (needed for both norm and non-norm shapelets).
-        let subs = get_all_subsequences(sample, n_channels, n_timepoints, length, dilation);
+        get_all_subsequences_into(
+            &mut subs,
+            sample,
+            n_channels,
+            n_timepoints,
+            length,
+            dilation,
+        );
 
         // --- Non-normalised shapelets ---
         for &i_shp in &group.non_norm {
@@ -102,15 +189,23 @@ fn transform_sample(
 
         // --- Normalised shapelets — compute mean/std once per (length, dilation) ---
         if !group.norm.is_empty() {
-            let (means, stds) =
-                sliding_mean_std(sample, n_channels, n_timepoints, length, dilation);
-            let norm_subs =
-                normalise_subsequences(&subs, &means, &stds, n_subs, n_channels, length);
+            sliding_mean_std_into(
+                &mut means,
+                &mut stds,
+                &mut sum,
+                &mut sum2,
+                sample,
+                n_channels,
+                n_timepoints,
+                length,
+                dilation,
+            );
+            normalise_subsequences_in_place(&mut subs, &means, &stds, n_subs, n_channels, length);
 
             for &i_shp in &group.norm {
                 let shp = &model.shapelets[i_shp];
                 let (min_dist, arg_min, occurrence) = compute_shapelet_features(
-                    &norm_subs,
+                    &subs,
                     &shp.values,
                     shp.threshold,
                     n_subs,
@@ -126,12 +221,110 @@ fn transform_sample(
     }
 }
 
+fn transform_sample_scores(
+    sample: &[f64],
+    n_channels: usize,
+    n_timepoints: usize,
+    model: &RdstModel,
+    groups: &[ShapeletGroup],
+    classifier: &PreparedRidgeParams,
+    scores: &mut [f64],
+) {
+    let mut subs = Vec::new();
+    let mut means = Vec::new();
+    let mut stds = Vec::new();
+    let mut sum = Vec::new();
+    let mut sum2 = Vec::new();
+
+    for group in groups {
+        let length = group.length;
+        let dilation = group.dilation;
+
+        let min_needed = (length - 1) * dilation + 1;
+        if n_timepoints < min_needed {
+            continue;
+        }
+        let n_subs = n_timepoints - (length - 1) * dilation;
+        get_all_subsequences_into(
+            &mut subs,
+            sample,
+            n_channels,
+            n_timepoints,
+            length,
+            dilation,
+        );
+
+        for &i_shp in &group.non_norm {
+            let shp = &model.shapelets[i_shp];
+            let (min_dist, arg_min, occurrence) = compute_shapelet_features(
+                &subs,
+                &shp.values,
+                shp.threshold,
+                n_subs,
+                n_channels,
+                length,
+            );
+            add_shapelet_scores(scores, classifier, i_shp, min_dist, arg_min, occurrence);
+        }
+
+        if !group.norm.is_empty() {
+            sliding_mean_std_into(
+                &mut means,
+                &mut stds,
+                &mut sum,
+                &mut sum2,
+                sample,
+                n_channels,
+                n_timepoints,
+                length,
+                dilation,
+            );
+            normalise_subsequences_in_place(&mut subs, &means, &stds, n_subs, n_channels, length);
+
+            for &i_shp in &group.norm {
+                let shp = &model.shapelets[i_shp];
+                let (min_dist, arg_min, occurrence) = compute_shapelet_features(
+                    &subs,
+                    &shp.values,
+                    shp.threshold,
+                    n_subs,
+                    n_channels,
+                    length,
+                );
+                add_shapelet_scores(scores, classifier, i_shp, min_dist, arg_min, occurrence);
+            }
+        }
+    }
+}
+
+#[inline]
+fn add_shapelet_scores(
+    scores: &mut [f64],
+    classifier: &PreparedRidgeParams,
+    i_shp: usize,
+    min_dist: f64,
+    arg_min: f64,
+    occurrence: f64,
+) {
+    let feature_off = 3 * i_shp;
+    for (row, score) in scores.iter_mut().enumerate().take(classifier.n_rows) {
+        let coef_off = row * classifier.n_cols + feature_off;
+        *score += min_dist * classifier.coef[coef_off]
+            + arg_min * classifier.coef[coef_off + 1]
+            + occurrence * classifier.coef[coef_off + 2];
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Group bookkeeping
 // ---------------------------------------------------------------------------
 
 /// Precomputed index lists for a `(length, dilation)` group.
-struct ShapeletGroup {
+pub(crate) struct ShapeletGroup {
+    /// Number of time points in the shapelets in this group.
+    length: usize,
+    /// Dilation factor used by the shapelets in this group.
+    dilation: usize,
     /// Shapelet indices with `normalise = false`.
     non_norm: Vec<usize>,
     /// Shapelet indices with `normalise = true`.
@@ -139,12 +332,14 @@ struct ShapeletGroup {
 }
 
 /// Builds the `(length, dilation) → ShapeletGroup` map from a model.
-fn build_groups(model: &RdstModel) -> HashMap<(usize, usize), ShapeletGroup> {
+pub(crate) fn build_groups(model: &RdstModel) -> Vec<ShapeletGroup> {
     let mut map: HashMap<(usize, usize), ShapeletGroup> = HashMap::new();
     for (i, shp) in model.shapelets.iter().enumerate() {
         let entry = map
             .entry((shp.length, shp.dilation))
             .or_insert(ShapeletGroup {
+                length: shp.length,
+                dilation: shp.dilation,
                 non_norm: Vec::new(),
                 norm: Vec::new(),
             });
@@ -154,7 +349,9 @@ fn build_groups(model: &RdstModel) -> HashMap<(usize, usize), ShapeletGroup> {
             entry.non_norm.push(i);
         }
     }
-    map
+    let mut groups: Vec<_> = map.into_values().collect();
+    groups.sort_by_key(|group| (group.length, group.dilation));
+    groups
 }
 
 // ---------------------------------------------------------------------------

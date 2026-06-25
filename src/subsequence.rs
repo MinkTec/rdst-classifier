@@ -37,6 +37,35 @@ pub fn get_all_subsequences(
     let n_subs = n_timepoints - (length - 1) * dilation;
     let stride = n_channels * length;
     let mut result = vec![0.0f64; n_subs * stride];
+    get_all_subsequences_into(&mut result, x, n_channels, n_timepoints, length, dilation);
+    result
+}
+
+/// Writes all dilated subsequences of a single-sample time series into `result`.
+pub fn get_all_subsequences_into(
+    result: &mut Vec<f64>,
+    x: &[f64],
+    n_channels: usize,
+    n_timepoints: usize,
+    length: usize,
+    dilation: usize,
+) {
+    let n_subs = n_timepoints - (length - 1) * dilation;
+    let stride = n_channels * length;
+    result.resize(n_subs * stride, 0.0);
+
+    if dilation == 1 {
+        for i_sub in 0..n_subs {
+            let sub_off = i_sub * stride;
+            for c in 0..n_channels {
+                let x_start = c * n_timepoints + i_sub;
+                let sub_c_off = sub_off + c * length;
+                result[sub_c_off..sub_c_off + length]
+                    .copy_from_slice(&x[x_start..x_start + length]);
+            }
+        }
+        return;
+    }
 
     for i_sub in 0..n_subs {
         let sub_off = i_sub * stride;
@@ -49,7 +78,6 @@ pub fn get_all_subsequences(
             }
         }
     }
-    result
 }
 
 // ---------------------------------------------------------------------------
@@ -70,12 +98,42 @@ pub fn sliding_mean_std(
     length: usize,
     dilation: usize,
 ) -> (Vec<f64>, Vec<f64>) {
+    let mut means = Vec::new();
+    let mut stds = Vec::new();
+    let mut sum = Vec::new();
+    let mut sum2 = Vec::new();
+    sliding_mean_std_into(
+        &mut means,
+        &mut stds,
+        &mut sum,
+        &mut sum2,
+        x,
+        n_channels,
+        n_timepoints,
+        length,
+        dilation,
+    );
+    (means, stds)
+}
+
+/// Computes per-channel sliding mean/std into reusable output and scratch buffers.
+pub fn sliding_mean_std_into(
+    means: &mut Vec<f64>,
+    stds: &mut Vec<f64>,
+    sum: &mut Vec<f64>,
+    sum2: &mut Vec<f64>,
+    x: &[f64],
+    n_channels: usize,
+    n_timepoints: usize,
+    length: usize,
+    dilation: usize,
+) {
     let n_subs = n_timepoints - (length - 1) * dilation;
 
-    let mut means = vec![0.0f64; n_channels * n_subs];
-    let mut stds = vec![0.0f64; n_channels * n_subs];
-    let mut sum = vec![0.0f64; n_channels];
-    let mut sum2 = vec![0.0f64; n_channels];
+    means.resize(n_channels * n_subs, 0.0);
+    stds.resize(n_channels * n_subs, 0.0);
+    sum.resize(n_channels, 0.0);
+    sum2.resize(n_channels, 0.0);
 
     for i_mod_dil in 0..dilation {
         // Indices of the first subsequence for this congruence class.
@@ -100,7 +158,7 @@ pub fn sliding_mean_std(
 
         // Write first subsequence stats.
         write_mean_std(
-            (&mut means, &mut stds),
+            (means.as_mut_slice(), stds.as_mut_slice()),
             (&sum, &sum2),
             n_channels,
             n_subs,
@@ -128,7 +186,7 @@ pub fn sliding_mean_std(
             }
 
             write_mean_std(
-                (&mut means, &mut stds),
+                (means.as_mut_slice(), stds.as_mut_slice()),
                 (&sum, &sum2),
                 n_channels,
                 n_subs,
@@ -141,8 +199,6 @@ pub fn sliding_mean_std(
             i_sub_start += dilation;
         }
     }
-
-    (means, stds)
 }
 
 #[inline(always)]
@@ -163,8 +219,9 @@ fn write_mean_std(
         let variance = sum2[c] / len_f - m * m;
         if variance > STD_THRESHOLD {
             stds[c * n_subs + i_sub] = variance.sqrt();
+        } else {
+            stds[c * n_subs + i_sub] = 0.0;
         }
-        // else std stays 0.0 (already initialised)
     }
 }
 
@@ -184,23 +241,101 @@ pub fn normalise_subsequences(
     n_channels: usize,
     length: usize,
 ) -> Vec<f64> {
-    let mut result = vec![0.0f64; subs.len()];
+    let mut result = subs.to_vec();
+    normalise_subsequences_in_place(&mut result, means, stds, n_subs, n_channels, length);
+    result
+}
+
+/// Z-normalises subsequences in place using precomputed `means` and `stds`.
+pub fn normalise_subsequences_in_place(
+    subs: &mut [f64],
+    means: &[f64],
+    stds: &[f64],
+    n_subs: usize,
+    n_channels: usize,
+    length: usize,
+) {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if length >= 4 && std::arch::is_x86_feature_detected!("avx2") {
+            unsafe {
+                normalise_subsequences_in_place_avx2(subs, means, stds, n_subs, n_channels, length);
+            }
+            return;
+        }
+    }
+
+    normalise_subsequences_in_place_scalar(subs, means, stds, n_subs, n_channels, length);
+}
+
+fn normalise_subsequences_in_place_scalar(
+    subs: &mut [f64],
+    means: &[f64],
+    stds: &[f64],
+    n_subs: usize,
+    n_channels: usize,
+    length: usize,
+) {
+    let stride = n_channels * length;
 
     for i_sub in 0..n_subs {
         for c in 0..n_channels {
             let std = stds[c * n_subs + i_sub];
+            let off = i_sub * stride + c * length;
             if std > STD_THRESHOLD {
                 let mean = means[c * n_subs + i_sub];
-                let src_off = i_sub * n_channels * length + c * length;
-                let dst_off = src_off;
                 for j in 0..length {
-                    result[dst_off + j] = (subs[src_off + j] - mean) / std;
+                    subs[off + j] = (subs[off + j] - mean) / std;
                 }
+            } else {
+                subs[off..off + length].fill(0.0);
             }
-            // else: stays 0.0 — correct normalisation when std ≈ 0
         }
     }
-    result
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn normalise_subsequences_in_place_avx2(
+    subs: &mut [f64],
+    means: &[f64],
+    stds: &[f64],
+    n_subs: usize,
+    n_channels: usize,
+    length: usize,
+) {
+    let stride = n_channels * length;
+
+    for i_sub in 0..n_subs {
+        for c in 0..n_channels {
+            let mean_std_off = c * n_subs + i_sub;
+            let std = stds[mean_std_off];
+            let off = i_sub * stride + c * length;
+
+            if std > STD_THRESHOLD {
+                let mean_v = arch::_mm256_set1_pd(means[mean_std_off]);
+                let inv_std_v = arch::_mm256_set1_pd(1.0 / std);
+                let mut j = 0usize;
+
+                while j + 4 <= length {
+                    let ptr = unsafe { subs.as_mut_ptr().add(off + j) };
+                    let values = unsafe { arch::_mm256_loadu_pd(ptr) };
+                    let centered = arch::_mm256_sub_pd(values, mean_v);
+                    let normalised = arch::_mm256_mul_pd(centered, inv_std_v);
+                    unsafe { arch::_mm256_storeu_pd(ptr, normalised) };
+                    j += 4;
+                }
+
+                while j < length {
+                    let idx = off + j;
+                    subs[idx] = (subs[idx] - means[mean_std_off]) / std;
+                    j += 1;
+                }
+            } else {
+                subs[off..off + length].fill(0.0);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -225,6 +360,25 @@ pub fn compute_shapelet_features(
 ) -> (f64, f64, f64) {
     let stride = n_channels * length;
 
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if stride >= 4 && std::arch::is_x86_feature_detected!("avx2") {
+            return unsafe {
+                compute_shapelet_features_avx2(subs, shp_values, threshold, n_subs, stride)
+            };
+        }
+    }
+
+    compute_shapelet_features_scalar(subs, shp_values, threshold, n_subs, stride)
+}
+
+fn compute_shapelet_features_scalar(
+    subs: &[f64],
+    shp_values: &[f64],
+    threshold: f64,
+    n_subs: usize,
+    stride: usize,
+) -> (f64, f64, f64) {
     let mut min_dist = f64::INFINITY;
     let mut arg_min = 0usize;
     let mut occurrence = 0.0f64;
@@ -250,6 +404,71 @@ pub fn compute_shapelet_features(
     }
 
     (min_dist, arg_min as f64, occurrence)
+}
+
+#[cfg(target_arch = "x86")]
+use std::arch::x86 as arch;
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64 as arch;
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn compute_shapelet_features_avx2(
+    subs: &[f64],
+    shp_values: &[f64],
+    threshold: f64,
+    n_subs: usize,
+    stride: usize,
+) -> (f64, f64, f64) {
+    let mut min_dist = f64::INFINITY;
+    let mut arg_min = 0usize;
+    let mut occurrence = 0.0f64;
+
+    for i_sub in 0..n_subs {
+        let sub_slice = &subs[i_sub * stride..(i_sub + 1) * stride];
+        let dist = unsafe { l1_distance_avx2(sub_slice, shp_values) };
+
+        if dist < min_dist {
+            min_dist = dist;
+            arg_min = i_sub;
+        }
+        if dist < threshold {
+            occurrence += 1.0;
+        }
+    }
+
+    (min_dist, arg_min as f64, occurrence)
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn l1_distance_avx2(a: &[f64], b: &[f64]) -> f64 {
+    debug_assert_eq!(a.len(), b.len());
+
+    let mut i = 0usize;
+    let len = a.len();
+    let mut acc = arch::_mm256_setzero_pd();
+    let abs_mask = arch::_mm256_castsi256_pd(arch::_mm256_set1_epi64x(0x7fff_ffff_ffff_ffff));
+
+    while i + 4 <= len {
+        let av = unsafe { arch::_mm256_loadu_pd(a.as_ptr().add(i)) };
+        let bv = unsafe { arch::_mm256_loadu_pd(b.as_ptr().add(i)) };
+        let diff = arch::_mm256_sub_pd(av, bv);
+        let abs = arch::_mm256_and_pd(diff, abs_mask);
+        acc = arch::_mm256_add_pd(acc, abs);
+        i += 4;
+    }
+
+    let mut lanes = [0.0f64; 4];
+    unsafe { arch::_mm256_storeu_pd(lanes.as_mut_ptr(), acc) };
+    let mut sum = lanes.iter().sum::<f64>();
+
+    while i < len {
+        sum += (unsafe { *a.get_unchecked(i) } - unsafe { *b.get_unchecked(i) }).abs();
+        i += 1;
+    }
+
+    sum
 }
 
 // ---------------------------------------------------------------------------

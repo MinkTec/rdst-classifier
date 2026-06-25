@@ -15,8 +15,42 @@
 
 use crate::{
     math::{sigmoid, softmax},
-    model::RidgeParams,
+    model::{RidgeParams, ScalerParams},
 };
+
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedRidgeParams {
+    pub coef: Vec<f64>,
+    pub intercept: Vec<f64>,
+    pub n_rows: usize,
+    pub n_cols: usize,
+}
+
+impl PreparedRidgeParams {
+    pub fn new(params: &RidgeParams, scaler: &ScalerParams) -> Self {
+        let mut coef = vec![0.0; params.coef.len()];
+        let mut intercept = params.intercept.clone();
+
+        for row in 0..params.n_rows {
+            let row_off = row * params.n_cols;
+            for col in 0..params.n_cols {
+                let scale = scaler.scale[col];
+                if scale != 0.0 {
+                    let adjusted = params.coef[row_off + col] / scale;
+                    coef[row_off + col] = adjusted;
+                    intercept[row] -= scaler.mean[col] * adjusted;
+                }
+            }
+        }
+
+        Self {
+            coef,
+            intercept,
+            n_rows: params.n_rows,
+            n_cols: params.n_cols,
+        }
+    }
+}
 
 /// Predicts a hard class label for each row in `x`.
 ///
@@ -95,6 +129,66 @@ pub fn predict_proba(
             }
         }
     }
+    result
+}
+
+pub(crate) fn predict_from_scores(
+    scores: &[f64],
+    n_samples: usize,
+    params: &RidgeParams,
+) -> Vec<String> {
+    if params.is_binary() {
+        (0..n_samples)
+            .map(|i| {
+                if scores[i] > 0.0 {
+                    params.classes[1].clone()
+                } else {
+                    params.classes[0].clone()
+                }
+            })
+            .collect()
+    } else {
+        (0..n_samples)
+            .map(|i| {
+                let row = &scores[i * params.n_rows..(i + 1) * params.n_rows];
+                let mut best_score = f64::NEG_INFINITY;
+                let mut best_class = 0usize;
+                for (class, &score) in row.iter().enumerate() {
+                    if score > best_score {
+                        best_score = score;
+                        best_class = class;
+                    }
+                }
+                params.classes[best_class].clone()
+            })
+            .collect()
+    }
+}
+
+pub(crate) fn predict_proba_from_scores(
+    scores: &[f64],
+    n_samples: usize,
+    params: &RidgeParams,
+) -> Vec<f64> {
+    let n_classes = params.n_classes();
+    let mut result = vec![0.0f64; n_samples * n_classes];
+
+    if params.is_binary() {
+        for i in 0..n_samples {
+            let p = sigmoid(scores[i]);
+            result[i * 2] = 1.0 - p;
+            result[i * 2 + 1] = p;
+        }
+    } else {
+        for i in 0..n_samples {
+            let score_row = &scores[i * params.n_rows..(i + 1) * params.n_rows];
+            let proba = softmax(score_row);
+            for c in 0..n_classes {
+                result[i * n_classes + c] = proba[c];
+            }
+        }
+    }
+
     result
 }
 

@@ -80,13 +80,21 @@ use std::sync::Arc;
 /// ```
 pub struct RdstClassifier {
     model: RdstModel,
+    groups: Vec<transform::ShapeletGroup>,
+    classifier: classifier::PreparedRidgeParams,
 }
 
 impl RdstClassifier {
     /// Loads a model from a JSON string produced by the aeon export helper.
     pub fn from_json(json: &str) -> Result<Self, ClassifierError> {
         let model = model_io::from_json(json)?;
-        Ok(Self { model })
+        let groups = transform::build_groups(&model);
+        let classifier = classifier::PreparedRidgeParams::new(&model.classifier, &model.scaler);
+        Ok(Self {
+            model,
+            groups,
+            classifier,
+        })
     }
 
     /// Loads a model from a `.tar.gz` archive containing a single JSON file.
@@ -119,12 +127,18 @@ impl RdstClassifier {
         n_timepoints: usize,
     ) -> Result<Vec<String>, ClassifierError> {
         self.check_dims(x, n_samples, n_channels, n_timepoints)?;
-        let features = self.extract_features(x, n_samples, n_channels, n_timepoints);
-        let n_features = self.model.n_shapelets * 3;
-        Ok(classifier::predict(
-            &features,
+        let scores = transform::transform_scores(
+            x,
             n_samples,
-            n_features,
+            n_channels,
+            n_timepoints,
+            &self.model,
+            &self.groups,
+            &self.classifier,
+        );
+        Ok(classifier::predict_from_scores(
+            &scores,
+            n_samples,
             &self.model.classifier,
         ))
     }
@@ -141,12 +155,18 @@ impl RdstClassifier {
         n_timepoints: usize,
     ) -> Result<Vec<f64>, ClassifierError> {
         self.check_dims(x, n_samples, n_channels, n_timepoints)?;
-        let features = self.extract_features(x, n_samples, n_channels, n_timepoints);
-        let n_features = self.model.n_shapelets * 3;
-        Ok(classifier::predict_proba(
-            &features,
+        let scores = transform::transform_scores(
+            x,
             n_samples,
-            n_features,
+            n_channels,
+            n_timepoints,
+            &self.model,
+            &self.groups,
+            &self.classifier,
+        );
+        Ok(classifier::predict_proba_from_scores(
+            &scores,
+            n_samples,
             &self.model.classifier,
         ))
     }
@@ -154,18 +174,6 @@ impl RdstClassifier {
     // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
-
-    fn extract_features(
-        &self,
-        x: &[f64],
-        n_samples: usize,
-        n_channels: usize,
-        n_timepoints: usize,
-    ) -> Vec<f64> {
-        let n_features = self.model.n_shapelets * 3;
-        let raw = transform::transform(x, n_samples, n_channels, n_timepoints, &self.model);
-        scaler::scale(&raw, n_samples, n_features, &self.model.scaler)
-    }
 
     fn check_dims(
         &self,
