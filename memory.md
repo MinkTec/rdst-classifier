@@ -37,3 +37,12 @@
 - Final portable-build single reruns: single predict `197.48 us`, single predict_proba `215.19 us`.
 - Second-pass speedups versus the first-pass final medians: batch predict `2.57x`, batch predict_proba `2.43x`, single predict `2.48x`, single predict_proba `2.32x`.
 - Total speedups versus the original synthetic baseline medians: batch predict `6.24x`, batch predict_proba `6.76x`, single predict `5.81x`, single predict_proba `4.95x`.
+
+## 2026-06-25, post-push exploration
+
+- Pushed commit `42cd484` (`Optimize RDST inference hot path`) to `origin/main`.
+- GPU research: `wgpu` is the practical Rust-native cross-platform compute route for Vulkan/Metal/D3D12/WebGPU-style backends, but WGSL/wgpu compute is effectively `f32`/`f16` oriented for portable shaders. This RDST engine is currently `f64` and regression-tested against aeon/Dart outputs, so a GPU backend would either need an approximate `f32` mode or backend-specific nonportable shader extensions. GPU dispatch and upload overhead also makes the current single-window target unlikely to beat AVX2 CPU execution.
+- NPU research: CoreML/ANE, NNAPI, and similar NPUs are designed around fixed neural-network graphs and low-precision tensor ops (`f16`, `i8`, sometimes `f32`). RDST's custom dilated shapelet search, argmin, occurrence counts, and `f64` arithmetic do not map cleanly without a major approximation/reformulation.
+- Recommendation: preserve the exact CPU path as the default library ABI. If GPU is pursued later, make it an optional approximate/batch-only backend, likely `f32`, and benchmark only for large batches or very large production models where transfer/dispatch overhead can be amortized.
+- Follow-up experiment: AVX2 normalization is not always worthwhile for small shapelet lengths. Raising the SIMD normalization cutoff from length `>= 4` to `>= 8` improved the synthetic run: batch predict `1.4844 ms`, batch predict_proba `1.5047 ms`, single predict `176.11 us`, single predict_proba `172.73 us`.
+- Rejected follow-up: disabling AVX2 normalization for synthetic lengths via cutoff `>= 16` was slightly worse (`1.5478 ms`, `1.5547 ms`, `183.01 us`, `180.55 us`), so the cutoff remains `>= 8`.

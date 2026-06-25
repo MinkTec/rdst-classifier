@@ -257,7 +257,7 @@ pub fn normalise_subsequences_in_place(
 ) {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
-        if length >= 4 && std::arch::is_x86_feature_detected!("avx2") {
+        if length >= 8 && std::arch::is_x86_feature_detected!("avx2") {
             unsafe {
                 normalise_subsequences_in_place_avx2(subs, means, stds, n_subs, n_channels, length);
             }
